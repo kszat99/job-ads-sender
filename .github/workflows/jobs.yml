@@ -1,1 +1,51 @@
+name: PL Jobs Digest
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # ~07:00 Europe/Warsaw (zimą). Ręczny start też dostępny.
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Run jobs watcher
+        env:
+          ADZUNA_APP_ID:        ${{ secrets.ADZUNA_APP_ID }}
+          ADZUNA_APP_KEY:       ${{ secrets.ADZUNA_APP_KEY }}
+          GMAIL_USER:           ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD:   ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_TO:             ${{ secrets.EMAIL_TO }}
+
+          # opcjonalne nadpisania (jeśli ustawisz w Variables/Secrets)
+          ALWAYS_EMAIL:         ${{ vars.ALWAYS_EMAIL }}
+          PREVIEW_LAST_N:       ${{ vars.PREVIEW_LAST_N }}
+          DRY_RUN:              ${{ vars.DRY_RUN }}
+        run: python jobs_watch.py
+
+      - name: Commit state if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ -n "$(git status --porcelain)" ]; then
+            git add data/jobs_state.json
+            git commit -m "Update jobs_state.json [skip ci]"
+            git push
+          else
+            echo "No changes to commit."
+          fi
 
