@@ -4,8 +4,9 @@
 # - per-profile last_seen & seen_ids in data/jobs_state.json
 # - proper multi-term OR via `what_or=python,sql,l2`
 # - english detection via lingua-language-detector (pure Python)
+# - SUBJECT COUNTERS + CSV ATTACHMENT (new)
 
-import os, json, smtplib, ssl, math
+import os, json, smtplib, ssl, math, csv, io, re
 from pathlib import Path
 from datetime import datetime, timezone
 from email.message import EmailMessage
@@ -96,6 +97,12 @@ def km_distance(lat1, lon1, lat2, lon2):
 
 def canon_url(u):
     return (u or "").strip().lower()
+
+def snippet(txt, limit=200):
+    if not txt: return ""
+    t = re.sub(r"\s+", " ", txt).strip()
+    if len(t) <= limit: return t
+    return t[:limit-1] + "…"
 
 # ----------- language detection (lingua-language-detector) -----------
 from lingua import Language, LanguageDetectorBuilder
@@ -237,6 +244,7 @@ def fetch_adzuna_page(country, page, prof):
         "app_key": ADZUNA_APP_KEY,
         "results_per_page": int(prof.get("results_per_page") or 50),
         "sort_by": "date",
+        "content-type": "application/json",
     }
     # multi-term OR
     if keywords_any:
@@ -317,6 +325,25 @@ def build_section_html(title, items, is_preview):
     parts.append("</ul>")
     return "".join(parts)
 
+def build_subject(sections_info, always_email):
+    # sections_info: list of dicts {name, new_count, is_preview}
+    total_new = sum(s["new_count"] for s in sections_info)
+    if total_new == 0 and always_email:
+        return "[Jobs] No new — preview only"
+    if total_new == 0:
+        return "[Jobs] No new today"
+    entries = []
+    for s in sections_info:
+        if s["new_count"] > 0:
+            entries.append(f"{s['name']}: {s['new_count']} new")
+        else:
+            entries.append(f"{s['name']}: preview")
+    # keep subject reasonable length
+    subj_core = " • ".join(entries)
+    if len(subj_core) > 180:
+        subj_core = subj_core[:177] + "…"
+    return f"[Jobs] {subj_core}"
+
 def build_email(all_sections, subject_suffix, always_email):
     any_items = any(len(items)>0 for _, items, _ in all_sections)
     subject = f"[Jobs] Daily digest — {subject_suffix}"
@@ -347,14 +374,54 @@ def build_email(all_sections, subject_suffix, always_email):
         plain.append("No new jobs today.")
     return subject, "\n".join(plain), html_body
 
-def send_email(items_sections, subject_suffix, always_email):
-    subject, plain_text, html_body = build_email(items_sections, subject_suffix, always_email)
+def build_csv(all_sections_with_flags):
+    """
+    Build CSV (string) for all sections combined.
+    all_sections_with_flags: list of tuples (section_name, items, is_preview, new_uid_set)
+    """
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow([
+        "section","is_new","created_at","title","company","location","country",
+        "salary_min","salary_max","source","url","remote_detected","english_detected",
+        "uid","desc_snippet"
+    ])
+    for name, items, is_preview, new_uids in all_sections_with_flags:
+        for it in items:
+            is_new = (it["uid"] in new_uids)
+            created = it["created_at"].isoformat() if it["created_at"] else ""
+            txt = (it.get("title","") + " " + it.get("desc","")).strip()
+            eng = looks_english(txt, 0.60)
+            rem = is_remote_like(txt)
+            w.writerow([
+                name,
+                "true" if is_new else "false",
+                created,
+                it["title"],
+                it["company"],
+                it["location"],
+                it["country"],
+                it["salary_min"] or "",
+                it["salary_max"] or "",
+                it["source"],
+                it["url"],
+                "true" if rem else "false",
+                "true" if eng else "false",
+                it["uid"],
+                snippet(it.get("desc",""))
+            ])
+    return buf.getvalue()
+
+def send_email(items_sections, subject_text, html_body, csv_text, csv_filename):
     msg = EmailMessage()
-    msg["Subject"] = subject
+    msg["Subject"] = subject_text
     msg["From"] = GMAIL_USER
     msg["To"] = EMAIL_TO
-    msg.set_content(plain_text)
+    # plain part from HTML-stripped fallback:
+    msg.set_content("Daily jobs digest attached as CSV.\n(Open the HTML part for a nicer view.)")
     msg.add_alternative(html_body, subtype="html")
+    if csv_text:
+        msg.add_attachment(csv_text, maintype="text", subtype="csv", filename=csv_filename)
     ctx = ssl.create_default_context()
     with smtplib.SMTP("smtp.gmail.com", 587) as smtp:
         smtp.starttls(context=ctx)
@@ -374,7 +441,10 @@ def main():
     lang_min_prob = float((settings.get("language_detection") or {}).get("min_prob", 0.60))
 
     global_seen_uids = set()
-    sections = []
+    sections_basic = []             # for legacy body: list of (name, items, is_preview)
+    sections_with_flags = []        # for CSV: list of (name, items, is_preview, new_uid_set)
+    sections_info = []              # for subject counters
+
     now_utc = datetime.now(timezone.utc)
 
     for prof in searches:
@@ -414,10 +484,15 @@ def main():
 
         # choose items for this section
         if new_items:
-            sections.append((name, new_items, False))
+            sections_basic.append((name, new_items, False))
+            new_uid_set = {it["uid"] for it in new_items}
+            sections_with_flags.append((name, new_items, False, new_uid_set))
+            sections_info.append({"name": name, "new_count": len(new_items), "is_preview": False})
         else:
             preview = items[:max(preview_n, 0)]
-            sections.append((name, preview, True))
+            sections_basic.append((name, preview, True))
+            sections_with_flags.append((name, preview, True, set()))
+            sections_info.append({"name": name, "new_count": 0, "is_preview": True})
 
         # advance watermark to newest fetched for this profile (clamped to now)
         newest_ts = max((it["created_at"] for it in items if it["created_at"]), default=last_seen)
@@ -432,14 +507,26 @@ def main():
                 seen_ids.add(it["uid"])
         prof_state["seen_ids"] = list(seen_ids)[-50000:]
 
+    # Build subject with counters
+    subject_counters = build_subject(sections_info, always_email)
+
+    # Legacy subject suffix (kept for continuity inside the HTML)
+    tagline = ", ".join(p["name"] for p in searches)
+
+    # Build email body (HTML & plain)
+    _, _, html_body = build_email(sections_basic, tagline, always_email)
+
+    # Build CSV attachment
+    csv_text = build_csv(sections_with_flags)
+    csv_filename = f"jobs_{now_utc.date().isoformat()}.csv"
+
     # send one email with all sections
     if not dry_run:
-        tagline = ", ".join(p["name"] for p in searches)
-        send_email(sections, tagline, always_email)
+        send_email(sections_basic, subject_counters, html_body, csv_text, csv_filename)
 
     save_state(state)
 
-    counts = ", ".join([f"{name}: {len(items)}{'P' if is_prev else 'N'}" for name, items, is_prev in sections])
+    counts = ", ".join([f"{s['name']}: {s['new_count']}{'' if not s['is_preview'] else 'P'}" for s in sections_info])
     print(f"[jobs] done: sections=({counts}), dry_run={dry_run}")
 
 if __name__ == "__main__":
