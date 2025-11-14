@@ -30,7 +30,7 @@
     },
     {
       "name": "Global remote (EN)",
-      "countries": ["gb","ie","de","nl","se","no","dk","fi","ch","at","be","lu","fr","it","es","pt","us","ca","au","nz","sg"],
+      ["gb","us","ca","au","nz","de","fr","nl","pl","in","za","sg","es","it"],
       "keywords_any": ["python", "sql", "l2"],
       "keywords_exclude": [],
       "location": "",
