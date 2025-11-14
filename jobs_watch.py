@@ -1,9 +1,10 @@
-# Adzuna Jobs Digest (multi-profile) — mirrors your watcher pattern
-# - per-profile "new" vs preview
+# Adzuna Jobs Digest (multi-profile)
+# - per-profile "new" vs preview (like your watchers)
 # - global de-dup across profiles
 # - per-profile last_seen & seen_ids in data/jobs_state.json
 # - optional env overrides for ALWAYS_EMAIL / PREVIEW_LAST_N / DRY_RUN
 # - english detection via lingua-language-detector (pure Python)
+# - FIX: "what" uses OR semantics to broaden results ("python OR sql OR l2")
 
 import os, json, smtplib, ssl, math
 from pathlib import Path
@@ -100,7 +101,7 @@ def canon_url(u):
 # ----------- language detection (lingua-language-detector) -----------
 from lingua import Language, LanguageDetectorBuilder
 
-# Keep a focused set (removed Norwegian to avoid enum mismatch)
+# Focused EU set (no NORWEGIAN enum here to avoid mismatch)
 _LANGS = [
     Language.ENGLISH, Language.POLISH, Language.GERMAN, Language.FRENCH, Language.DUTCH,
     Language.ITALIAN, Language.SPANISH, Language.PORTUGUESE,
@@ -201,7 +202,7 @@ def passes_filters(job, prof, lang_min_prob: float):
         except Exception:
             pass
 
-    # radius
+    # radius (only if both center and radius_km are set)
     center = prof.get("center")
     rk = prof.get("radius_km")
     if center and rk:
@@ -215,10 +216,11 @@ def passes_filters(job, prof, lang_min_prob: float):
         except Exception:
             pass
 
-    # location (lekko – Adzuna i tak filtruje po 'where')
+    # location (soft — Adzuna also filters by 'where')
     where = (prof.get("location") or "").strip()
     if where:
         if where.lower() not in job["location"].lower():
+            # allow remote-only entries even if location string mismatches
             if not (prof.get("remote_only") and is_remote_like(text)):
                 return False
 
@@ -226,11 +228,15 @@ def passes_filters(job, prof, lang_min_prob: float):
 
 # ----------- fetch -----------
 def fetch_adzuna_page(country, page, prof):
+    # Build "what" as OR to widen results (python OR sql OR l2)
+    what_terms = prof.get("keywords_any") or []
+    what_str = " OR ".join(what_terms) if what_terms else ""
+
     params = {
         "app_id": ADZUNA_APP_ID,
         "app_key": ADZUNA_APP_KEY,
         "results_per_page": int(prof.get("results_per_page") or 50),
-        "what": ",".join(prof.get("keywords_any") or []),
+        "what": what_str,
         "where": prof.get("location") or "",
         "sort_by": "date",
         "content-type": "application/json",
@@ -253,9 +259,18 @@ def fetch_profile_pool(prof, lang_min_prob: float):
         for p in range(1, max_pages + 1):
             try:
                 rows = fetch_adzuna_page(c, p, prof)
+            except requests.HTTPError as e:
+                # Soft-skip unsupported markets (404)
+                status = getattr(e.response, "status_code", None)
+                if status == 404:
+                    print(f"[jobs] {prof['name']} country={c} page={p} SKIP: 404")
+                    break
+                print(f"[jobs] {prof['name']} country={c} page={p} ERROR: {repr(e)}")
+                break
             except Exception as e:
                 print(f"[jobs] {prof['name']} country={c} page={p} ERROR: {repr(e)}")
                 break
+
             print(f"[jobs] {prof['name']} country={c} page={p} results={len(rows)}")
             if not rows:
                 break
@@ -366,6 +381,7 @@ def main():
 
         items = fetch_profile_pool(prof, lang_min_prob)
 
+        # global de-dup across profiles
         deduped = []
         for it in items:
             if it["uid"] in global_seen_uids:
@@ -374,6 +390,7 @@ def main():
             deduped.append(it)
         items = deduped
 
+        # determine "new"
         if last_seen:
             candidates = [
                 it for it in items
@@ -382,6 +399,7 @@ def main():
         else:
             candidates = []  # seed → preview only
 
+        # unique "new" for this profile
         run_seen, new_items = set(), []
         for it in candidates:
             uid = it["uid"]
@@ -390,23 +408,27 @@ def main():
             run_seen.add(uid)
             new_items.append(it)
 
+        # choose items for this section
         if new_items:
             sections.append((name, new_items, False))
         else:
             preview = items[:max(preview_n, 0)]
             sections.append((name, preview, True))
 
+        # advance watermark to newest fetched for this profile (clamped to now)
         newest_ts = max((it["created_at"] for it in items if it["created_at"]), default=last_seen)
         if newest_ts and newest_ts > now_utc:
             newest_ts = now_utc
         if newest_ts:
             prof_state["last_seen"] = newest_ts.isoformat()
 
+        # persist seen_ids only for actually-sent "new"
         for it in new_items:
             if it["uid"]:
                 seen_ids.add(it["uid"])
         prof_state["seen_ids"] = list(seen_ids)[-50000:]
 
+    # send one email with all sections
     if not dry_run:
         tagline = ", ".join(p["name"] for p in searches)
         send_email(sections, tagline, always_email)
