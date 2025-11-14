@@ -54,7 +54,7 @@ def load_settings():
     # language detection config (optional)
     ld = s.get("language_detection") or {}
     s["language_detection"] = {
-        "min_prob": float(ld.get("min_prob", 0.60))  # kept for compatibility; lingua uses confidence 0..1 too
+        "min_prob": float(ld.get("min_prob", 0.60))
     }
     return s
 
@@ -100,27 +100,21 @@ def canon_url(u):
 # ----------- language detection (lingua-language-detector) -----------
 from lingua import Language, LanguageDetectorBuilder
 
-# Focus on EN vs common EU languages you’ll hit. This keeps it fast & precise.
+# Keep a focused set (removed Norwegian to avoid enum mismatch)
 _LANGS = [
     Language.ENGLISH, Language.POLISH, Language.GERMAN, Language.FRENCH, Language.DUTCH,
     Language.ITALIAN, Language.SPANISH, Language.PORTUGUESE,
-    Language.SWEDISH, Language.NORWEGIAN, Language.DANISH, Language.FINNISH,
+    Language.SWEDISH, Language.DANISH, Language.FINNISH,
     Language.CZECH, Language.SLOVAK, Language.ROMANIAN, Language.HUNGARIAN
 ]
 _DETECTOR = LanguageDetectorBuilder.from_languages(*_LANGS).build()
 
 def looks_english(text: str, min_prob: float = 0.60) -> bool:
-    """
-    Detect EN using Lingua. Returns True if detected language is EN with decent confidence.
-    Falls back to a tiny heuristic only if detection fails.
-    """
+    """Detect EN with Lingua; fallback to tiny heuristic on errors."""
     if not text:
         return False
     t = text[:10000]
     try:
-        # Lingua doesn't expose a single "probability" like CLD3, but we can:
-        # 1) detect language
-        # 2) compute confidence for EN specifically
         lang = _DETECTOR.detect_language_of(t)
         if lang == Language.ENGLISH:
             conf = _DETECTOR.compute_language_confidence(t, Language.ENGLISH)  # 0..1
@@ -192,7 +186,6 @@ def passes_filters(job, prof, lang_min_prob: float):
     # english_only (strict for non-native English markets)
     if prof.get("english_only"):
         if job["country"] in EN_NATIVE:
-            # Native EN market — usually English; no strict check needed.
             pass
         else:
             if not looks_english((job["title"] or "") + " " + (job["desc"] or ""), min_prob=lang_min_prob):
@@ -226,7 +219,6 @@ def passes_filters(job, prof, lang_min_prob: float):
     where = (prof.get("location") or "").strip()
     if where:
         if where.lower() not in job["location"].lower():
-            # jeżeli remote_only=true i wpis jest remote — przepuść mimo słabego location string
             if not (prof.get("remote_only") and is_remote_like(text)):
                 return False
 
@@ -249,7 +241,6 @@ def fetch_adzuna_page(country, page, prof):
     return r.json().get("results", []) or []
 
 def fetch_profile_pool(prof, lang_min_prob: float):
-    # wybór krajów: country (1) lub countries (lista)
     if prof.get("country"):
         countries = [prof["country"]]
     else:
@@ -270,14 +261,12 @@ def fetch_profile_pool(prof, lang_min_prob: float):
                 break
             for j in rows:
                 nj = normalize_job_adzuna(j, c)
-                # wstępne filtry (po profilu)
                 if passes_filters(nj, prof, lang_min_prob):
                     uid = nj["uid"]
                     if uid not in seen:
                         seen.add(uid)
                         merged.append(nj)
 
-    # newest first
     merged.sort(key=lambda it: it["created_at"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
     return merged
 
@@ -310,7 +299,6 @@ def build_section_html(title, items, is_preview):
     return "".join(parts)
 
 def build_email(all_sections, subject_suffix, always_email):
-    # all_sections: list of tuples (profile_name, items, is_preview)
     any_items = any(len(items)>0 for _, items, _ in all_sections)
     subject = f"[Jobs] Daily digest — {subject_suffix}"
     if not any_items and not always_email:
@@ -366,9 +354,7 @@ def main():
     dry_run = bool(settings.get("dry_run", False))
     lang_min_prob = float((settings.get("language_detection") or {}).get("min_prob", 0.60))
 
-    # global de-dup across profiles
     global_seen_uids = set()
-
     sections = []
     now_utc = datetime.now(timezone.utc)
 
@@ -378,10 +364,8 @@ def main():
         last_seen = datetime.fromisoformat(prof_state["last_seen"]) if prof_state.get("last_seen") else None
         seen_ids = set(prof_state.get("seen_ids", []))
 
-        # fetch + filter pool for this profile
         items = fetch_profile_pool(prof, lang_min_prob)
 
-        # remove items already taken by previous profiles (global dedup)
         deduped = []
         for it in items:
             if it["uid"] in global_seen_uids:
@@ -390,7 +374,6 @@ def main():
             deduped.append(it)
         items = deduped
 
-        # determine "new"
         if last_seen:
             candidates = [
                 it for it in items
@@ -399,7 +382,6 @@ def main():
         else:
             candidates = []  # seed → preview only
 
-        # unique "new" for this profile (avoid re-sending same uid)
         run_seen, new_items = set(), []
         for it in candidates:
             uid = it["uid"]
@@ -408,34 +390,29 @@ def main():
             run_seen.add(uid)
             new_items.append(it)
 
-        # pick section items (new or preview)
         if new_items:
             sections.append((name, new_items, False))
         else:
             preview = items[:max(preview_n, 0)]
             sections.append((name, preview, True))
 
-        # advance watermark to newest fetched for this profile (clamped to now)
         newest_ts = max((it["created_at"] for it in items if it["created_at"]), default=last_seen)
         if newest_ts and newest_ts > now_utc:
             newest_ts = now_utc
         if newest_ts:
             prof_state["last_seen"] = newest_ts.isoformat()
 
-        # persist seen_ids only for actually-sent "new"
         for it in new_items:
             if it["uid"]:
                 seen_ids.add(it["uid"])
         prof_state["seen_ids"] = list(seen_ids)[-50000:]
 
-    # send one email with all sections
     if not dry_run:
         tagline = ", ".join(p["name"] for p in searches)
         send_email(sections, tagline, always_email)
 
     save_state(state)
 
-    # logs
     counts = ", ".join([f"{name}: {len(items)}{'P' if is_prev else 'N'}" for name, items, is_prev in sections])
     print(f"[jobs] done: sections=({counts}), dry_run={dry_run}")
 
