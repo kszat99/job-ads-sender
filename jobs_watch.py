@@ -2,9 +2,8 @@
 # - per-profile "new" vs preview (like your watchers)
 # - global de-dup across profiles
 # - per-profile last_seen & seen_ids in data/jobs_state.json
-# - optional env overrides for ALWAYS_EMAIL / PREVIEW_LAST_N / DRY_RUN
+# - proper multi-term OR via `what_or=python,sql,l2`
 # - english detection via lingua-language-detector (pure Python)
-# - FIX: "what" uses OR semantics to broaden results ("python OR sql OR l2")
 
 import os, json, smtplib, ssl, math
 from pathlib import Path
@@ -35,7 +34,7 @@ def _env_int(name, default):
 
 STATE_PATH = Path("data/jobs_state.json")
 SETTINGS_PATH = Path("settings.json")
-ADZUNA_BASE = "https://api.adzuna.com/v1/api/jobs"
+ADZUNA_BASE = "https://api.adzuna.com/v1/api"
 
 EN_NATIVE = {"gb","us","ca","au","nz","ie","sg"}  # anglojęzyczne
 
@@ -101,7 +100,7 @@ def canon_url(u):
 # ----------- language detection (lingua-language-detector) -----------
 from lingua import Language, LanguageDetectorBuilder
 
-# Focused EU set (no NORWEGIAN enum here to avoid mismatch)
+# Focused EU set (no NORWEGIAN enum here)
 _LANGS = [
     Language.ENGLISH, Language.POLISH, Language.GERMAN, Language.FRENCH, Language.DUTCH,
     Language.ITALIAN, Language.SPANISH, Language.PORTUGUESE,
@@ -164,7 +163,7 @@ def normalize_job_adzuna(j, country_code):
     }
 
 def passes_filters(job, prof, lang_min_prob: float):
-    # keywords include/exclude
+    # keywords include/exclude (client-side safety filter)
     title = job["title"].lower()
     comp  = job["company"].lower()
     desc  = (job["desc"] or "").lower()
@@ -228,21 +227,31 @@ def passes_filters(job, prof, lang_min_prob: float):
 
 # ----------- fetch -----------
 def fetch_adzuna_page(country, page, prof):
-    # Build "what" as OR to widen results (python OR sql OR l2)
-    what_terms = prof.get("keywords_any") or []
-    what_str = " OR ".join(what_terms) if what_terms else ""
-
+    """
+    Build params with `what_or` for multi-term OR.
+    Keep `where` if provided (e.g., 'Warsaw'); no radius here.
+    """
+    keywords_any = prof.get("keywords_any") or []
     params = {
         "app_id": ADZUNA_APP_ID,
         "app_key": ADZUNA_APP_KEY,
         "results_per_page": int(prof.get("results_per_page") or 50),
-        "what": what_str,
-        "where": prof.get("location") or "",
         "sort_by": "date",
-        "content-type": "application/json",
     }
-    url = f"{ADZUNA_BASE}/{country}/search/{page}"
+    # multi-term OR
+    if keywords_any:
+        params["what_or"] = ",".join(keywords_any)
+    # location string (optional; if you want Warsaw, prefer the English exonym)
+    where = (prof.get("location") or "").strip()
+    if where:
+        params["where"] = where
+
+    url = f"{ADZUNA_BASE}/jobs/{country}/search/{page}"
     r = requests.get(url, params=params, timeout=25)
+    if r.status_code == 404:
+        # market not supported for your key / public API
+        print(f"[jobs] {prof['name']} country={country} page={page} SKIP: 404")
+        return []
     r.raise_for_status()
     return r.json().get("results", []) or []
 
@@ -260,11 +269,6 @@ def fetch_profile_pool(prof, lang_min_prob: float):
             try:
                 rows = fetch_adzuna_page(c, p, prof)
             except requests.HTTPError as e:
-                # Soft-skip unsupported markets (404)
-                status = getattr(e.response, "status_code", None)
-                if status == 404:
-                    print(f"[jobs] {prof['name']} country={c} page={p} SKIP: 404")
-                    break
                 print(f"[jobs] {prof['name']} country={c} page={p} ERROR: {repr(e)}")
                 break
             except Exception as e:
