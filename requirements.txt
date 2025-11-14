@@ -1,2 +1,2 @@
 requests
-pycld3
+lingua-language-detector
