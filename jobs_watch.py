@@ -1,17 +1,15 @@
-
 # Adzuna Jobs Digest (multi-profile) — mirrors your watcher pattern
 # - per-profile "new" vs preview
 # - global de-dup across profiles
 # - per-profile last_seen & seen_ids in data/jobs_state.json
 # - optional env overrides for ALWAYS_EMAIL / PREVIEW_LAST_N / DRY_RUN
-# - english detection via pycld3
+# - english detection via lingua-language-detector (pure Python)
 
 import os, json, smtplib, ssl, math
 from pathlib import Path
 from datetime import datetime, timezone
 from email.message import EmailMessage
 import requests
-import pycld3  # NEW: language detection
 
 # ----------- ENV (secrets) -----------
 ADZUNA_APP_ID  = os.environ["ADZUNA_APP_ID"]
@@ -38,7 +36,7 @@ STATE_PATH = Path("data/jobs_state.json")
 SETTINGS_PATH = Path("settings.json")
 ADZUNA_BASE = "https://api.adzuna.com/v1/api/jobs"
 
-EN_NATIVE = {"gb","us","ca","au","nz","ie","sg"}  # kraje anglojęzyczne
+EN_NATIVE = {"gb","us","ca","au","nz","ie","sg"}  # anglojęzyczne
 
 # ----------- IO helpers -----------
 def ensure_dir(p: Path):
@@ -56,7 +54,7 @@ def load_settings():
     # language detection config (optional)
     ld = s.get("language_detection") or {}
     s["language_detection"] = {
-        "min_prob": float(ld.get("min_prob", 0.60))
+        "min_prob": float(ld.get("min_prob", 0.60))  # kept for compatibility; lingua uses confidence 0..1 too
     }
     return s
 
@@ -99,36 +97,45 @@ def km_distance(lat1, lon1, lat2, lon2):
 def canon_url(u):
     return (u or "").strip().lower()
 
-# ----------- language detection (pycld3) -----------
-_DETECTOR = pycld3.NNetLanguageIdentifier(min_num_bytes=0, max_num_bytes=10000)
+# ----------- language detection (lingua-language-detector) -----------
+from lingua import Language, LanguageDetectorBuilder
+
+# Focus on EN vs common EU languages you’ll hit. This keeps it fast & precise.
+_LANGS = [
+    Language.ENGLISH, Language.POLISH, Language.GERMAN, Language.FRENCH, Language.DUTCH,
+    Language.ITALIAN, Language.SPANISH, Language.PORTUGUESE,
+    Language.SWEDISH, Language.NORWEGIAN, Language.DANISH, Language.FINNISH,
+    Language.CZECH, Language.SLOVAK, Language.ROMANIAN, Language.HUNGARIAN
+]
+_DETECTOR = LanguageDetectorBuilder.from_languages(*_LANGS).build()
 
 def looks_english(text: str, min_prob: float = 0.60) -> bool:
     """
-    Use CLD3 to detect 'en'. Returns True if language == 'en' with sufficient probability.
+    Detect EN using Lingua. Returns True if detected language is EN with decent confidence.
     Falls back to a tiny heuristic only if detection fails.
     """
     if not text:
         return False
+    t = text[:10000]
     try:
-        t = text[:10000]
-        r = _DETECTOR.FindLanguage(t)
-        if r and r.language == "en":
-            # primary check: reliable + prob ≥ min_prob
-            if (r.probability or 0.0) >= min_prob and r.is_reliable:
-                return True
-            # soft acceptance for very high probability even if is_reliable is False
-            if (r.probability or 0.0) >= max(0.85, min_prob):
+        # Lingua doesn't expose a single "probability" like CLD3, but we can:
+        # 1) detect language
+        # 2) compute confidence for EN specifically
+        lang = _DETECTOR.detect_language_of(t)
+        if lang == Language.ENGLISH:
+            conf = _DETECTOR.compute_language_confidence(t, Language.ENGLISH)  # 0..1
+            if conf >= min_prob:
                 return True
     except Exception:
         pass
 
     # minimal fallback if detector errors (rare)
-    t = text.lower()
+    tl = t.lower()
     kw = ["remote","engineer","developer","requirements","responsibilities","benefits",
           "apply","experience","position","stack","team","salary","usd","eur",
           "hybrid","onsite","python","sql","support","incident","cloud","devops"]
-    hits = sum(1 for k in kw if k in t)
-    ascii_ratio = sum(ch.isascii() for ch in t) / max(1, len(t))
+    hits = sum(1 for k in kw if k in tl)
+    ascii_ratio = sum(ch.isascii() for ch in tl) / max(1, len(tl))
     return ascii_ratio > 0.85 or hits >= 2
 
 def is_remote_like(text: str) -> bool:
