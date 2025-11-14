@@ -1,1 +1,45 @@
-
+{
+  "searches": [
+    {
+      "name": "Warszawa ±10km",
+      "country": "pl",
+      "keywords_any": ["python", "sql", "l2"],
+      "keywords_exclude": [],
+      "location": "Warszawa",
+      "center": { "lat": 52.2297, "lng": 21.0122 },
+      "radius_km": 10,
+      "remote_only": false,
+      "english_only": false,          // w PL dopuszczamy PL i EN
+      "results_per_page": 50,
+      "max_pages": 8,
+      "min_salary": null
+    },
+    {
+      "name": "Poland remote (PL/EN)",
+      "country": "pl",
+      "keywords_any": ["python", "sql", "l2"],
+      "keywords_exclude": [],
+      "location": "",                 // brak miasta – cały kraj
+      "remote_only": true,            // tylko oferty zdalne
+      "english_only": false,          // w PL akceptuj PL/EN
+      "results_per_page": 50,
+      "max_pages": 6,
+      "min_salary": null
+    },
+    {
+      "name": "Global remote (EN)",
+      "countries": ["gb","ie","de","nl","se","no","dk","fi","ch","at","be","lu","fr","it","es","pt","us","ca","au","nz","sg"],
+      "keywords_any": ["python", "sql", "l2"],
+      "keywords_exclude": [],
+      "location": "",
+      "remote_only": true,
+      "english_only": true,           // wymagaj EN poza PL
+      "results_per_page": 50,
+      "max_pages": 2,
+      "min_salary": null
+    }
+  ],
+  "always_email": true,
+  "preview_last_n": 10,
+  "dry_run": false
+}
