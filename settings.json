@@ -6,8 +6,6 @@
       "keywords_any": ["python", "sql", "l2"],
       "keywords_exclude": [],
       "location": "Warszawa",
-      "center": { "lat": 52.2297, "lng": 21.0122 },
-      "radius_km": 10,
       "remote_only": false,
       "english_only": false,
       "results_per_page": 50,
@@ -30,7 +28,7 @@
     },
     {
       "name": "Global remote (EN)",
-      ["gb","us","ca","au","nz","de","fr","nl","pl","in","za","sg","es","it"],
+      "countries": ["gb","ie","de","nl","se","no","dk","fi","ch","at","be","lu","fr","it","es","pt","us","ca","au","nz","sg"],
       "keywords_any": ["python", "sql", "l2"],
       "keywords_exclude": [],
       "location": "",
