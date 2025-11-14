@@ -1,0 +1,16 @@
+{
+  "profiles": {
+    "Warszawa ±10km": {
+      "last_seen": null,
+      "seen_ids": []
+    },
+    "Poland remote (PL/EN)": {
+      "last_seen": null,
+      "seen_ids": []
+    },
+    "Global remote (EN)": {
+      "last_seen": null,
+      "seen_ids": []
+    }
+  }
+}
