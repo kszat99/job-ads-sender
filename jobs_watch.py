@@ -421,7 +421,9 @@ def send_email(items_sections, subject_text, html_body, csv_text, csv_filename):
     msg.set_content("Daily jobs digest attached as CSV.\n(Open the HTML part for a nicer view.)")
     msg.add_alternative(html_body, subtype="html")
     if csv_text:
-        msg.add_attachment(csv_text, maintype="text", subtype="csv", filename=csv_filename)
+        msg.add_attachment(csv_text.encode("utf-8"),
+                   maintype="text", subtype="csv",
+                   filename=csv_filename)
     ctx = ssl.create_default_context()
     with smtplib.SMTP("smtp.gmail.com", 587) as smtp:
         smtp.starttls(context=ctx)
