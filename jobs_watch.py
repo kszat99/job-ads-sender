@@ -1,16 +1,32 @@
 # Adzuna Jobs Digest (multi-profile)
-# - per-profile "new" vs preview (like your watchers)
-# - global de-dup across profiles
-# - per-profile last_seen & seen_ids in data/jobs_state.json
-# - proper multi-term OR via `what_or=python,sql,l2`
-# - english detection via lingua-language-detector (pure Python)
-# - SUBJECT COUNTERS + CSV ATTACHMENT (new)
+# - per-profile "new" vs preview (jak w watcherach)
+# - global de-dup
+# - per-profile last_seen & seen_ids w data/jobs_state.json
+# - OR po słowach kluczowych via what_or=python,sql,l2
+# - wykrywanie EN via lingua-language-detector
+# - SUBJECT COUNTERS + CSV ATTACHMENT
+# - PUBLISHER: wyprowadzany z przekierowania Adzuny (opcjonalnie)
+#
+# ENV wymagane:
+#   ADZUNA_APP_ID, ADZUNA_APP_KEY, GMAIL_USER, GMAIL_APP_PASSWORD, EMAIL_TO
+#
+# ENV opcjonalne:
+#   ALWAYS_EMAIL=1|0
+#   PREVIEW_LAST_N=10
+#   DRY_RUN=0|1
+#   RESOLVE_PUBLISHER_REDIRECTS=1|0           (domyślnie 0 = nie śledzimy)
+#   RESOLVE_PUBLISHER_MAX=<int>|""            ("" lub brak = bez limitu)
+#   RESOLVE_WORKERS=8                         (liczba wątków dla resolvera)
+#   RESOLVE_TIMEOUT=6                         (sekundy dla HEAD/GET)
 
 import os, json, smtplib, ssl, math, csv, io, re
 from pathlib import Path
 from datetime import datetime, timezone
 from email.message import EmailMessage
 import requests
+from urllib.parse import urlparse
+from functools import lru_cache
+import concurrent.futures
 
 # ----------- ENV (secrets) -----------
 ADZUNA_APP_ID  = os.environ["ADZUNA_APP_ID"]
@@ -20,11 +36,11 @@ GMAIL_USER         = os.environ["GMAIL_USER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 EMAIL_TO           = os.environ["EMAIL_TO"]
 
-# optional env overrides
+# ----------- ENV helpers -----------
 def _env_bool(name, default):
     v = os.environ.get(name, None)
     if v is None: return default
-    return str(v).strip() in ("1","true","True","yes","YES")
+    return str(v).strip().lower() in ("1","true","yes")
 
 def _env_int(name, default):
     v = os.environ.get(name, None)
@@ -33,11 +49,19 @@ def _env_int(name, default):
     try: return int(v)
     except: return default
 
+def _env_int_or_none(name):
+    v = os.environ.get(name, None)
+    if v is None: return None
+    s = str(v).strip()
+    if s == "": return None
+    try: return int(s)
+    except: return None
+
 STATE_PATH = Path("data/jobs_state.json")
 SETTINGS_PATH = Path("settings.json")
 ADZUNA_BASE = "https://api.adzuna.com/v1/api"
 
-EN_NATIVE = {"gb","us","ca","au","nz","ie","sg"}  # anglojęzyczne
+EN_NATIVE = {"gb","us","ca","au","nz","ie","sg"}  # rynki natywnie EN
 
 # ----------- IO helpers -----------
 def ensure_dir(p: Path):
@@ -46,17 +70,12 @@ def ensure_dir(p: Path):
 def load_settings():
     with SETTINGS_PATH.open("r", encoding="utf-8") as f:
         s = json.load(f)
-
-    # env overrides (optional knobs)
     s["always_email"]   = _env_bool("ALWAYS_EMAIL", s.get("always_email", True))
     s["preview_last_n"] = _env_int("PREVIEW_LAST_N", int(s.get("preview_last_n", 10)))
     s["dry_run"]        = _env_bool("DRY_RUN", s.get("dry_run", False))
 
-    # language detection config (optional)
     ld = s.get("language_detection") or {}
-    s["language_detection"] = {
-        "min_prob": float(ld.get("min_prob", 0.60))
-    }
+    s["language_detection"] = {"min_prob": float(ld.get("min_prob", 0.60))}
     return s
 
 def load_state():
@@ -66,7 +85,7 @@ def load_state():
                 return json.load(f)
             except Exception:
                 pass
-    return {"profiles": {}}
+    return {"profiles": {}, "publishers": {}}
 
 def save_state(st):
     ensure_dir(STATE_PATH)
@@ -86,17 +105,17 @@ def iso_to_dt(s):
             return None
 
 def km_distance(lat1, lon1, lat2, lon2):
-    # Haversine
     R = 6371.0088
-    phi1 = math.radians(lat1); phi2 = math.radians(lat2)
+    import math as _m
+    phi1 = _m.radians(lat1); phi2 = _m.radians(lat2)
     dphi = phi2 - phi1
-    dl   = math.radians(lon2 - lon1)
-    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dl/2)**2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    dl   = _m.radians(lon2 - lon1)
+    a = _m.sin(dphi/2)**2 + _m.cos(phi1)*_m.cos(phi2)*_m.sin(dl/2)**2
+    c = 2 * _m.atan2(_m.sqrt(a), _m.sqrt(1-a))
     return R * c
 
 def canon_url(u):
-    return (u or "").strip().lower()
+    return (u or "").strip()
 
 def snippet(txt, limit=200):
     if not txt: return ""
@@ -104,10 +123,21 @@ def snippet(txt, limit=200):
     if len(t) <= limit: return t
     return t[:limit-1] + "…"
 
-# ----------- language detection (lingua-language-detector) -----------
-from lingua import Language, LanguageDetectorBuilder
+def _domain(u: str) -> str:
+    try:
+        h = urlparse(u).netloc.lower()
+        return h[4:] if h.startswith("www.") else h
+    except Exception:
+        return ""
 
-# Focused EU set (no NORWEGIAN enum here)
+_ADZ_ID_RX = re.compile(r"/ad/(\d+)")
+
+def adzuna_id_from_url(u: str) -> str | None:
+    m = _ADZ_ID_RX.search(u or "")
+    return m.group(1) if m else None
+
+# ----------- language detection (lingua) -----------
+from lingua import Language, LanguageDetectorBuilder
 _LANGS = [
     Language.ENGLISH, Language.POLISH, Language.GERMAN, Language.FRENCH, Language.DUTCH,
     Language.ITALIAN, Language.SPANISH, Language.PORTUGUESE,
@@ -117,20 +147,17 @@ _LANGS = [
 _DETECTOR = LanguageDetectorBuilder.from_languages(*_LANGS).build()
 
 def looks_english(text: str, min_prob: float = 0.60) -> bool:
-    """Detect EN with Lingua; fallback to tiny heuristic on errors."""
     if not text:
         return False
     t = text[:10000]
     try:
         lang = _DETECTOR.detect_language_of(t)
         if lang == Language.ENGLISH:
-            conf = _DETECTOR.compute_language_confidence(t, Language.ENGLISH)  # 0..1
+            conf = _DETECTOR.compute_language_confidence(t, Language.ENGLISH)
             if conf >= min_prob:
                 return True
     except Exception:
         pass
-
-    # minimal fallback if detector errors (rare)
     tl = t.lower()
     kw = ["remote","engineer","developer","requirements","responsibilities","benefits",
           "apply","experience","position","stack","team","salary","usd","eur",
@@ -146,6 +173,31 @@ def is_remote_like(text: str) -> bool:
             "praca zdalna", "zdalnie", "100% zdalnie", "zdalna"]
     return any(k in t for k in keys)
 
+# ----------- publisher resolver -----------
+RESOLVE_PUBLISHER = _env_bool("RESOLVE_PUBLISHER_REDIRECTS", False)
+RESOLVE_MAX = _env_int_or_none("RESOLVE_PUBLISHER_MAX")  # None = bez limitu
+RESOLVE_WORKERS = _env_int("RESOLVE_WORKERS", 12)
+RESOLVE_TIMEOUT = _env_int("RESOLVE_TIMEOUT", 6)
+
+@lru_cache(maxsize=4096)
+def resolve_final_host(u: str) -> str:
+    try:
+        r = requests.head(u, allow_redirects=True, timeout=RESOLVE_TIMEOUT,
+                          headers={"User-Agent":"jobs-watch/1.0"})
+        h = _domain(r.url)
+        if h: return h
+    except Exception:
+        pass
+    try:
+        r = requests.get(u, allow_redirects=True, timeout=RESOLVE_TIMEOUT, stream=True,
+                         headers={"User-Agent":"jobs-watch/1.0"})
+        h = _domain(r.url)
+        if h: return h
+    except Exception:
+        pass
+    return _domain(u)
+
+# ----------- normalize & filters -----------
 def normalize_job_adzuna(j, country_code):
     created = iso_to_dt(j.get("created"))
     comp = (j.get("company") or {}).get("display_name") or ""
@@ -153,6 +205,8 @@ def normalize_job_adzuna(j, country_code):
     url  = canon_url(j.get("redirect_url") or "")
     lat  = j.get("latitude")
     lon  = j.get("longitude")
+    publisher = _domain(url)  # baseline (może zostać nadpisany po resolverze)
+
     return {
         "uid": str(j.get("id") or url or f"{j.get('title','')}|{comp}|{loc}"),
         "title": j.get("title") or "",
@@ -163,6 +217,7 @@ def normalize_job_adzuna(j, country_code):
         "salary_max": j.get("salary_max"),
         "url": url,
         "source": f"Adzuna/{country_code}",
+        "publisher": publisher,
         "desc": j.get("description") or "",
         "lat": lat,
         "lon": lon,
@@ -170,35 +225,26 @@ def normalize_job_adzuna(j, country_code):
     }
 
 def passes_filters(job, prof, lang_min_prob: float):
-    # keywords include/exclude (client-side safety filter)
-    title = job["title"].lower()
-    comp  = job["company"].lower()
+    title = (job["title"] or "").lower()
+    comp  = (job["company"] or "").lower()
     desc  = (job["desc"] or "").lower()
     text  = " ".join([title, comp, desc])
 
     inc = prof.get("keywords_any") or []
-    if inc:
-        if not any(k.lower() in text for k in inc):
-            return False
+    if inc and not any(k.lower() in text for k in inc):
+        return False
 
     exc = [x.lower() for x in (prof.get("keywords_exclude") or [])]
     if exc and any(x in text for x in exc):
         return False
 
-    # remote_only
-    if prof.get("remote_only"):
-        if not is_remote_like(text):
+    if prof.get("remote_only") and not is_remote_like(text):
+        return False
+
+    if prof.get("english_only") and job["country"] not in EN_NATIVE:
+        if not looks_english((job["title"] or "") + " " + (job["desc"] or ""), min_prob=lang_min_prob):
             return False
 
-    # english_only (strict for non-native English markets)
-    if prof.get("english_only"):
-        if job["country"] in EN_NATIVE:
-            pass
-        else:
-            if not looks_english((job["title"] or "") + " " + (job["desc"] or ""), min_prob=lang_min_prob):
-                return False
-
-    # min_salary
     ms = prof.get("min_salary")
     if ms is not None:
         try:
@@ -208,7 +254,6 @@ def passes_filters(job, prof, lang_min_prob: float):
         except Exception:
             pass
 
-    # radius (only if both center and radius_km are set)
     center = prof.get("center")
     rk = prof.get("radius_km")
     if center and rk:
@@ -222,22 +267,15 @@ def passes_filters(job, prof, lang_min_prob: float):
         except Exception:
             pass
 
-    # location (soft — Adzuna also filters by 'where')
     where = (prof.get("location") or "").strip()
-    if where:
-        if where.lower() not in job["location"].lower():
-            # allow remote-only entries even if location string mismatches
-            if not (prof.get("remote_only") and is_remote_like(text)):
-                return False
+    if where and where.lower() not in job["location"].lower():
+        if not (prof.get("remote_only") and is_remote_like(text)):
+            return False
 
     return True
 
 # ----------- fetch -----------
 def fetch_adzuna_page(country, page, prof):
-    """
-    Build params with `what_or` for multi-term OR.
-    Keep `where` if provided (e.g., 'Warsaw'); no radius here.
-    """
     keywords_any = prof.get("keywords_any") or []
     params = {
         "app_id": ADZUNA_APP_ID,
@@ -246,10 +284,8 @@ def fetch_adzuna_page(country, page, prof):
         "sort_by": "date",
         "content-type": "application/json",
     }
-    # multi-term OR
     if keywords_any:
         params["what_or"] = ",".join(keywords_any)
-    # location string (optional; if you want Warsaw, prefer the English exonym)
     where = (prof.get("location") or "").strip()
     if where:
         params["where"] = where
@@ -257,7 +293,6 @@ def fetch_adzuna_page(country, page, prof):
     url = f"{ADZUNA_BASE}/jobs/{country}/search/{page}"
     r = requests.get(url, params=params, timeout=25)
     if r.status_code == 404:
-        # market not supported for your key / public API
         print(f"[jobs] {prof['name']} country={country} page={page} SKIP: 404")
         return []
     r.raise_for_status()
@@ -269,8 +304,7 @@ def fetch_profile_pool(prof, lang_min_prob: float):
     else:
         countries = prof.get("countries") or ["pl"]
 
-    merged = []
-    seen = set()
+    merged, seen = [], set()
     for c in countries:
         max_pages = int(prof.get("max_pages") or 2)
         for p in range(1, max_pages + 1):
@@ -316,17 +350,19 @@ def build_section_html(title, items, is_preview):
             elif b:     salary = f"{b:,}".replace(",", " ")
         salary_html = f" · <span style='color:#155'>{salary}</span>" if salary else ""
         link = f"<a href='{it['url']}' style='color:#0b57d0;text-decoration:none'>{it['title']}</a>" if it["url"] else it["title"]
+        pub = it.get("publisher") or ""
+        pub_html = f" · <span style='color:#777'>{pub}</span>" if pub else ""
         parts.append(
             "<li style='margin:0 0 14px'>"
             f"<div style='font-weight:600'>{link}</div>"
-            f"<div style='color:#555;font-size:13px'>{it['company']} · {it['location']} · {when}{salary_html} · <span style='color:#777'>{it['source']}</span></div>"
+            f"<div style='color:#555;font-size:13px'>{it['company']} · {it['location']} · {when}{salary_html} · "
+            f"<span style='color:#777'>{it['source']}</span>{pub_html}</div>"
             "</li>"
         )
     parts.append("</ul>")
     return "".join(parts)
 
 def build_subject(sections_info, always_email):
-    # sections_info: list of dicts {name, new_count, is_preview}
     total_new = sum(s["new_count"] for s in sections_info)
     if total_new == 0 and always_email:
         return "[Jobs] No new — preview only"
@@ -338,7 +374,6 @@ def build_subject(sections_info, always_email):
             entries.append(f"{s['name']}: {s['new_count']} new")
         else:
             entries.append(f"{s['name']}: preview")
-    # keep subject reasonable length
     subj_core = " • ".join(entries)
     if len(subj_core) > 180:
         subj_core = subj_core[:177] + "…"
@@ -375,15 +410,11 @@ def build_email(all_sections, subject_suffix, always_email):
     return subject, "\n".join(plain), html_body
 
 def build_csv(all_sections_with_flags):
-    """
-    Build CSV (string) for all sections combined.
-    all_sections_with_flags: list of tuples (section_name, items, is_preview, new_uid_set)
-    """
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow([
         "section","is_new","created_at","title","company","location","country",
-        "salary_min","salary_max","source","url","remote_detected","english_detected",
+        "salary_min","salary_max","source","publisher","url","remote_detected","english_detected",
         "uid","desc_snippet"
     ])
     for name, items, is_preview, new_uids in all_sections_with_flags:
@@ -404,6 +435,7 @@ def build_csv(all_sections_with_flags):
                 it["salary_min"] or "",
                 it["salary_max"] or "",
                 it["source"],
+                it.get("publisher",""),
                 it["url"],
                 "true" if rem else "false",
                 "true" if eng else "false",
@@ -412,18 +444,16 @@ def build_csv(all_sections_with_flags):
             ])
     return buf.getvalue()
 
-def send_email(items_sections, subject_text, html_body, csv_text, csv_filename):
+def send_email(subject_text, html_body, csv_text, csv_filename):
     msg = EmailMessage()
     msg["Subject"] = subject_text
     msg["From"] = GMAIL_USER
     msg["To"] = EMAIL_TO
-    # plain part from HTML-stripped fallback:
     msg.set_content("Daily jobs digest attached as CSV.\n(Open the HTML part for a nicer view.)")
     msg.add_alternative(html_body, subtype="html")
     if csv_text:
-        msg.add_attachment(csv_text.encode("utf-8"),
-                   maintype="text", subtype="csv",
-                   filename=csv_filename)
+        # ważne: bez 'maintype=' dla string payload
+        msg.add_attachment(csv_text, subtype="csv", filename=csv_filename)
     ctx = ssl.create_default_context()
     with smtplib.SMTP("smtp.gmail.com", 587) as smtp:
         smtp.starttls(context=ctx)
@@ -435,6 +465,7 @@ def main():
     settings = load_settings()
     state = load_state()
     profiles_state = state.setdefault("profiles", {})
+    pub_cache = state.setdefault("publishers", {})
 
     searches = settings.get("searches") or []
     always_email = settings.get("always_email", True)
@@ -443,12 +474,13 @@ def main():
     lang_min_prob = float((settings.get("language_detection") or {}).get("min_prob", 0.60))
 
     global_seen_uids = set()
-    sections_basic = []             # for legacy body: list of (name, items, is_preview)
-    sections_with_flags = []        # for CSV: list of (name, items, is_preview, new_uid_set)
-    sections_info = []              # for subject counters
+    sections_basic = []             # (name, items, is_preview)
+    sections_with_flags = []        # (name, items, is_preview, new_uid_set)
+    sections_info = []              # {name, new_count, is_preview}
 
     now_utc = datetime.now(timezone.utc)
 
+    # --- fetch & decide ---
     for prof in searches:
         name = prof["name"]
         prof_state = profiles_state.setdefault(name, {"last_seen": None, "seen_ids": []})
@@ -457,7 +489,7 @@ def main():
 
         items = fetch_profile_pool(prof, lang_min_prob)
 
-        # global de-dup across profiles
+        # global de-dup
         deduped = []
         for it in items:
             if it["uid"] in global_seen_uids:
@@ -466,16 +498,15 @@ def main():
             deduped.append(it)
         items = deduped
 
-        # determine "new"
+        # new vs preview
         if last_seen:
             candidates = [
                 it for it in items
                 if (it["created_at"] and it["created_at"] > last_seen) or (not it["created_at"] and it["uid"] not in seen_ids)
             ]
         else:
-            candidates = []  # seed → preview only
+            candidates = []
 
-        # unique "new" for this profile
         run_seen, new_items = set(), []
         for it in candidates:
             uid = it["uid"]
@@ -484,7 +515,6 @@ def main():
             run_seen.add(uid)
             new_items.append(it)
 
-        # choose items for this section
         if new_items:
             sections_basic.append((name, new_items, False))
             new_uid_set = {it["uid"] for it in new_items}
@@ -496,36 +526,71 @@ def main():
             sections_with_flags.append((name, preview, True, set()))
             sections_info.append({"name": name, "new_count": 0, "is_preview": True})
 
-        # advance watermark to newest fetched for this profile (clamped to now)
+        # watermark → newest fetched
         newest_ts = max((it["created_at"] for it in items if it["created_at"]), default=last_seen)
         if newest_ts and newest_ts > now_utc:
             newest_ts = now_utc
         if newest_ts:
             prof_state["last_seen"] = newest_ts.isoformat()
 
-        # persist seen_ids only for actually-sent "new"
+        # persist seen_ids dla "new"
         for it in new_items:
             if it["uid"]:
                 seen_ids.add(it["uid"])
         prof_state["seen_ids"] = list(seen_ids)[-50000:]
 
-    # Build subject with counters
+    # --- resolve publishers for items we're emailing (new + preview) ---
+    if RESOLVE_PUBLISHER:
+        to_resolve = []
+        # zbierz wszystkie itemy do wysłania
+        emailing_items = []
+        for _, items, _ in sections_basic:
+            emailing_items.extend(items)
+
+        for it in emailing_items:
+            url = it.get("url") or ""
+            if not url:
+                continue
+            adz_id = adzuna_id_from_url(url)
+            # jeśli już mamy finalną domenę zapisaną wcześniej
+            if adz_id and adz_id in pub_cache:
+                it["publisher"] = pub_cache[adz_id]
+                continue
+            # jeśli baseline jest sensowny (nie adzuna), nie musimy rozwiązywać
+            if it.get("publisher") and "adzuna" not in it["publisher"]:
+                continue
+            if adz_id:
+                to_resolve.append((adz_id, url, it))
+
+        # limit (None => bez limitu)
+        if RESOLVE_MAX is not None:
+            to_resolve = to_resolve[:RESOLVE_MAX]
+
+        if to_resolve:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=RESOLVE_WORKERS) as ex:
+                futs = {ex.submit(resolve_final_host, url): (adz_id, it) for adz_id, url, it in to_resolve}
+                for fut, (adz_id, it) in futs.items():
+                    try:
+                        host = fut.result()
+                        if host:
+                            it["publisher"] = host
+                            if adz_id:
+                                pub_cache[adz_id] = host
+                    except Exception:
+                        pass
+
+    # --- subject, body, csv, send ---
     subject_counters = build_subject(sections_info, always_email)
-
-    # Legacy subject suffix (kept for continuity inside the HTML)
     tagline = ", ".join(p["name"] for p in searches)
-
-    # Build email body (HTML & plain)
     _, _, html_body = build_email(sections_basic, tagline, always_email)
-
-    # Build CSV attachment
     csv_text = build_csv(sections_with_flags)
     csv_filename = f"jobs_{now_utc.date().isoformat()}.csv"
 
-    # send one email with all sections
     if not dry_run:
-        send_email(sections_basic, subject_counters, html_body, csv_text, csv_filename)
+        send_email(subject_counters, html_body, csv_text, csv_filename)
 
+    # zapisz updated state (w tym publishers cache)
+    state["publishers"] = pub_cache
     save_state(state)
 
     counts = ", ".join([f"{s['name']}: {s['new_count']}{'' if not s['is_preview'] else 'P'}" for s in sections_info])
